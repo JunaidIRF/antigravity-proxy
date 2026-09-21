@@ -19,27 +19,22 @@ The proxy listens on `http://127.0.0.1:8877` and exposes two endpoints:
 ### Step 1 — Check Prerequisites
 
 Ask the user:
-1. **Do you have Python 3.10+?** Check with `python3 --version`
-2. **Do you have the Antigravity CLI (`agy`) installed and authenticated?** Check with `ls ~/.gemini/antigravity-cli/antigravity-oauth-token`
+1. **Do you have Python 3.10+?** Check with `python --version`
+2. **Authenticate with Google:**
+   - **Windows:** Run `login.bat` or `python antigravity_proxy.py --login` (opens browser, signs in, saves tokens automatically).
+   - **macOS/Linux:** Run `python3 antigravity_proxy.py --login` or use the Antigravity CLI (`agy`).
 
-If they don't have `agy`, tell them to install it:
-- **macOS/Linux:** `curl -fsSL https://storage.googleapis.com/antigravity-releases/install.sh | bash`
-- **Windows:** Download from [antigravity.google](https://antigravity.google/)
+Check if token exists with: `python antigravity_proxy.py --check-token`
 
-Then authenticate: run `agy` once, sign in with Google account.
+### Step 2 — Start the Proxy
 
-### Step 2 — Clone and Start
-
-```bash
-git clone https://github.com/usamashehab/antigravity-proxy.git
-cd antigravity-proxy
-python3 antigravity_proxy.py
-```
+- **Windows:** Run `start_proxy.bat` (or `start_proxy_background.vbs` to run silently).
+- **macOS/Linux:** `python3 antigravity_proxy.py`
 
 Verify it's running:
 ```bash
 curl http://127.0.0.1:8877/health
-# Should return: {"status": "ok", "service": "antigravity-proxy"}
+# Should return: {"status": "ok", "service": "antigravity-proxy", "auth": {"authenticated": true, ...}}
 ```
 
 ### Step 3 — Configure Their Tool
@@ -48,10 +43,10 @@ Ask what tool they want to connect. Apply these settings:
 
 | Tool Type         | Base URL                              | API Key         | Model             |
 |-------------------|---------------------------------------|-----------------|-------------------|
-| OpenAI SDK        | `http://127.0.0.1:8877/v1`            | Any string      | See model table   |
-| Continue.dev      | `http://127.0.0.1:8877/v1`            | Any string      |                   |
-| Aider             | `--openai-api-base http://127.0.0.1:8877/v1` | Any string |                   |
-| Hermes Agent      | `hermes config set ...`               | Any string      |                   |
+| OpenAI SDK        | `http://127.0.0.1:8877/v1`            | Any string      | `gemini-3.8-flash` |
+| Continue.dev      | `http://127.0.0.1:8877/v1`            | Any string      | `gemini-3.8-flash` |
+| Aider             | `--openai-api-base http://127.0.0.1:8877/v1` | Any string | `gemini-3.8-flash` |
+| Hermes Agent      | `hermes config set ...`               | Any string      | `gemini-3.8-flash` |
 | Claude Code       | `ANTHROPIC_BASE_URL` env var          | N/A             | `claude-sonnet-4.6` |
 
 ### Step 4 — Verify It Works
@@ -60,7 +55,7 @@ Have them run a test request:
 ```bash
 curl http://127.0.0.1:8877/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "gemini-3.5-flash", "messages": [{"role": "user", "content": "Say hello"}]}'
+  -d '{"model": "gemini-3.8-flash", "messages": [{"role": "user", "content": "Say hello"}]}'
 ```
 
 ---
@@ -68,14 +63,20 @@ curl http://127.0.0.1:8877/v1/chat/completions \
 ## Available Models
 
 ```
+gemini-3.8-flash        Gemini 3.8 Flash (latest default)
+gemini-3.8-flash-high   Gemini 3.8 Flash (thinking: high)
+gemini-3.8-flash-low    Gemini 3.8 Flash (thinking: low)
+gemini-3.7-flash        Gemini 3.7 Flash
+gemini-3.6-flash        Gemini 3.6 Flash
+gemini-3.5-flash        Gemini 3.5 Flash
 gemini-3.1-pro          Gemini 3.1 Pro (thinking: low)
 gemini-3.1-pro-high     Gemini 3.1 Pro (thinking: high)
 gemini-3-flash          Gemini 3 Flash
-gemini-3.5-flash        Gemini 3.5 Flash
 gemini-2.5-pro          Gemini 2.5 Pro
 gemini-2.5-flash        Gemini 2.5 Flash
 claude-sonnet-4.6       Claude Sonnet 4.6
 claude-opus-4.6         Claude Opus 4.6 (thinking enabled)
+gpt-oss-120b            Open Source Model 120B
 ```
 
 ---

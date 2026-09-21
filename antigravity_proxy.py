@@ -27,19 +27,54 @@ Then configure Hermes:
 """
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import re
+import secrets
 import sys
 import threading
 import time
 import traceback
 import uuid
-from datetime import datetime, timezone
+import webbrowser
+from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+
+# Ensure UTF-8 output on Windows consoles
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _load_env_file():
+    """Load configuration from a local .env file if present."""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.isfile(env_path):
+        return
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip("\"'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except Exception:
+        pass
+
+
+_load_env_file()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -58,12 +93,46 @@ CLIENT_SECRET = os.environ.get(
     "GOCSPX-K58FWR486LdL" "J1mLB8sXC4z6qDAf",
 )
 
-TOKEN_FILE = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
+
+def _get_token_file_path() -> str:
+    """Resolve token file location across OSes and environment variables."""
+    env_path = os.environ.get("ANTIGRAVITY_TOKEN_PATH") or os.environ.get("ANTIGRAVITY_TOKEN_FILE")
+    if env_path:
+        return os.path.abspath(os.path.expanduser(env_path))
+
+    std_path = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
+    if os.path.isfile(std_path):
+        return os.path.abspath(std_path)
+
+    # Windows AppData fallbacks
+    if sys.platform == "win32":
+        for var in ("APPDATA", "LOCALAPPDATA"):
+            base = os.environ.get(var)
+            if base:
+                p = os.path.join(base, "antigravity-cli", "antigravity-oauth-token")
+                if os.path.isfile(p):
+                    return os.path.abspath(p)
+
+    return os.path.abspath(std_path)
+
+
+TOKEN_FILE = _get_token_file_path()
 OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
-CLOUDCODE_BASE = "https://cloudcode-pa.googleapis.com"
-LOAD_CODEASSIST_URL = f"{CLOUDCODE_BASE}/v1internal:loadCodeAssist"
-GENERATE_CONTENT_URL = f"{CLOUDCODE_BASE}/v1internal:generateContent"
-STREAM_GENERATE_CONTENT_URL = f"{CLOUDCODE_BASE}/v1internal:streamGenerateContent?alt=sse"
+# Upstream endpoints. Google Antigravity uses daily-cloudcode-pa.googleapis.com
+# for active service; cloudcode-pa.googleapis.com acts as secondary fallback.
+PRIMARY_ENDPOINT = os.environ.get(
+    "ANTIGRAVITY_ENDPOINT",
+    "https://daily-cloudcode-pa.googleapis.com",
+).rstrip("/")
+FALLBACK_ENDPOINT = (
+    "https://cloudcode-pa.googleapis.com"
+    if PRIMARY_ENDPOINT == "https://daily-cloudcode-pa.googleapis.com"
+    else "https://daily-cloudcode-pa.googleapis.com"
+)
+CLOUDCODE_BASE = PRIMARY_ENDPOINT
+LOAD_CODEASSIST_URL = f"{PRIMARY_ENDPOINT}/v1internal:loadCodeAssist"
+GENERATE_CONTENT_URL = f"{PRIMARY_ENDPOINT}/v1internal:generateContent"
+STREAM_GENERATE_CONTENT_URL = f"{PRIMARY_ENDPOINT}/v1internal:streamGenerateContent?alt=sse"
 
 ANTIGRAVITY_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -83,23 +152,68 @@ DEFAULT_SYSTEM_INSTRUCTION = "You are a helpful AI assistant."
 UPSTREAM_TIMEOUT = 300  # 5 minutes
 TOKEN_REFRESH_SKEW = 120  # refresh this many seconds before actual expiry
 
-# Model mapping: OpenAI-facing name -> Antigravity backend model name.
-# Tested against cloudcode-pa.googleapis.com on 2026-06-30.
 # Model mapping: OpenAI-facing name -> (backend model name, thinking level).
-# Gemini 3 Pro models use the base name "gemini-3.1-pro-low" and control
-# thinking compute via generationConfig.thinkingConfig.thinkingLevel.
+# Verified against active Google Cloud Code Assist backend models.
 MODEL_MAP = {
-    "gemini-3.1-pro": ("gemini-3.1-pro-low", "low"),
-    "gemini-3.1-pro-high": ("gemini-3.1-pro-low", "high"),
-    "gemini-3-flash": ("gemini-3-flash", None),
+    # Gemini 3.8 Flash (Low, Medium, High)
+    "gemini-3.8-flash": ("gemini-3.8-flash-tiered", "medium"),
+    "gemini-3.8-flash-low": ("gemini-3.8-flash-tiered", "low"),
+    "gemini-3.8-flash-medium": ("gemini-3.8-flash-tiered", "medium"),
+    "gemini-3.8-flash-high": ("gemini-3.8-flash-tiered", "high"),
+    "gemini-3.8-flash-tiered": ("gemini-3.8-flash-tiered", None),
+
+    # Gemini 3.7 Flash (Low, Medium, High)
+    "gemini-3.7-flash": ("gemini-3.7-flash-tiered", "medium"),
+    "gemini-3.7-flash-low": ("gemini-3.7-flash-tiered", "low"),
+    "gemini-3.7-flash-medium": ("gemini-3.7-flash-tiered", "medium"),
+    "gemini-3.7-flash-high": ("gemini-3.7-flash-tiered", "high"),
+    "gemini-3.7-flash-tiered": ("gemini-3.7-flash-tiered", None),
+
+    # Gemini 3.6 Flash (Low, Medium, High)
+    "gemini-3.6-flash": ("gemini-3.6-flash-tiered", "medium"),
+    "gemini-3.6-flash-low": ("gemini-3.6-flash-tiered", "low"),
+    "gemini-3.6-flash-medium": ("gemini-3.6-flash-tiered", "medium"),
+    "gemini-3.6-flash-high": ("gemini-3.6-flash-tiered", "high"),
+    "gemini-3.6-flash-tiered": ("gemini-3.6-flash-tiered", None),
+
+    # Gemini 3.5 & 3 Flash
     "gemini-3.5-flash": ("gemini-3.5-flash-low", None),
+    "gemini-3.5-flash-low": ("gemini-3.5-flash-low", None),
+    "gemini-3.5-flash-extra-low": ("gemini-3.5-flash-extra-low", None),
+    "gemini-3.5-flash-lite": ("gemini-3.5-flash-lite", None),
+    "gemini-3-flash": ("gemini-3-flash", None),
+    "gemini-3-flash-agent": ("gemini-3-flash-agent", None),
+
+    # Gemini 3.1 Pro (Only Low and High)
+    "gemini-3.1-pro": ("gemini-3.1-pro-low", "low"),
+    "gemini-3.1-pro-low": ("gemini-3.1-pro-low", "low"),
+    "gemini-3.1-pro-high": ("gemini-3.1-pro-low", "high"),
+
+    # Gemini 2.5 series
     "gemini-2.5-pro": ("gemini-2.5-pro", None),
     "gemini-2.5-flash": ("gemini-2.5-flash", None),
+    "gemini-2.5-flash-lite": ("gemini-2.5-flash-lite", None),
+    "gemini-2.5-flash-thinking": ("gemini-2.5-flash-thinking", None),
+
+    # Claude 4.6 series
     "claude-sonnet-4.6": ("claude-sonnet-4-6", None),
+    "claude-sonnet-4.6-thinking": ("claude-sonnet-4-6", None),
     "claude-opus-4.6": ("claude-opus-4-6-thinking", None),
+    "claude-opus-4.6-thinking": ("claude-opus-4-6-thinking", None),
+
+    # Open Source Models
+    "gpt-oss-120b": ("gpt-oss-120b-medium", None),
+    "gpt-oss-120b-medium": ("gpt-oss-120b-medium", None),
+
+    # Client aliases and fallbacks
+    "claude-3-7-sonnet": ("claude-sonnet-4-6", None),
+    "claude-3-5-sonnet": ("claude-sonnet-4-6", None),
+    "claude-3-5-sonnet-20241022": ("claude-sonnet-4-6", None),
+    "claude-3-opus": ("claude-opus-4-6-thinking", None),
+    "gemini-2.0-flash": ("gemini-2.5-flash", None),
 }
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Token / OAuth management (thread-safe)
@@ -115,32 +229,50 @@ def _log(msg: str):
     print(f"[antigravity-proxy] {msg}", file=sys.stderr, flush=True)
 
 
-def _parse_expiry(expiry_raw):
-    """Parse the 'expiry' field from the token file into a unix timestamp.
+def _parse_expiry(expiry_raw) -> float:
+    """Parse the 'expiry' field into a unix timestamp float.
 
-    The Antigravity CLI stores expiry as an RFC3339 string like
-    "2026-06-30T12:55:03.123456789Z". Python stdlib datetime.fromisoformat
-    can't handle nanosecond precision, so we truncate to 6 digits.
+    Handles:
+      - float/int unix timestamp in seconds
+      - float/int unix timestamp in milliseconds
+      - string numeric timestamps ("1726900000", "1726900000000")
+      - RFC3339 / ISO8601 strings ("2026-06-30T12:55:03.123456789Z", "2026-06-30T12:55:03+00:00")
     """
     if not expiry_raw:
         return 0.0
     if isinstance(expiry_raw, (int, float)):
-        return float(expiry_raw)
+        val = float(expiry_raw)
+        return val / 1000.0 if val > 1e11 else val
+
     s = str(expiry_raw).strip()
-    # Truncate sub-second precision to microseconds for fromisoformat.
+    if not s:
+        return 0.0
+
+    # Try numeric string (e.g. "1719750000" or "1719750000000")
     try:
+        val = float(s)
+        return val / 1000.0 if val > 1e11 else val
+    except ValueError:
+        pass
+
+    # ISO8601 / RFC3339 parsing
+    try:
+        # Standardize 'Z' to '+00:00' for universal Python 3.10+ compatibility
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+
+        # Truncate nanoseconds to microseconds (max 6 decimal places)
         if "." in s:
             head, tail = s.split(".", 1)
-            # Keep only the part up to 'Z' or timezone offset, truncate ns.
             tz_part = ""
             for i, ch in enumerate(tail):
-                if ch in "Z+-":
+                if ch in "+-":
                     tz_part = tail[i:]
                     tail = tail[:i]
                     break
-            tail = tail[:6]  # microseconds max
+            tail = tail[:6]  # at most 6 digits for microseconds
             s = f"{head}.{tail}{tz_part}"
-        # fromisoformat in 3.12 handles 'Z' suffix.
+
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
@@ -151,27 +283,39 @@ def _parse_expiry(expiry_raw):
 
 def _read_token_from_disk():
     """Read and parse the token file. Returns the raw dict or None."""
+    target = _get_token_file_path()
     try:
-        with open(TOKEN_FILE, "r") as f:
+        with open(target, "r", encoding="utf-8") as f:
             return json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
-        _log(f"WARNING: could not read token file {TOKEN_FILE}: {e}")
+    except (OSError, json.JSONDecodeError):
         return None
 
 
 def _write_token_to_disk(data: dict):
-    """Persist updated token data back to disk (atomic-ish)."""
+    """Persist updated token data back to disk (atomic and Windows safe)."""
+    target = _get_token_file_path()
     try:
-        tmp = TOKEN_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, TOKEN_FILE)
+        parent_dir = os.path.dirname(target)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+        tmp = target + f".tmp.{os.getpid()}.{threading.get_ident()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        # On Windows, os.replace might fail if locked; retry up to 5 times.
+        for attempt in range(5):
+            try:
+                os.replace(tmp, target)
+                break
+            except OSError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (2 ** attempt))
         try:
-            os.chmod(TOKEN_FILE, 0o600)
+            os.chmod(target, 0o600)
         except OSError:
             pass
     except OSError as e:
-        _log(f"WARNING: could not write token file: {e}")
+        _log(f"WARNING: could not write token file {target}: {e}")
 
 
 def _refresh_access_token(refresh_token: str) -> dict:
@@ -201,54 +345,281 @@ def _refresh_access_token(refresh_token: str) -> dict:
     except URLError as e:
         raise RuntimeError(f"OAuth refresh network error: {e}")
 
+    expires_in = int(payload.get("expires_in", 3600))
+    exp_dt = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+    expiry_str = exp_dt.strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+
     new_tok = {
         "access_token": payload["access_token"],
         "refresh_token": payload.get("refresh_token", refresh_token),
         "token_type": payload.get("token_type", "Bearer"),
-        "expiry": payload.get("expires_in", 3600),
+        "expiry": expiry_str,
     }
-    # Convert expires_in (seconds) to an RFC3339 expiry timestamp ~now.
-    expires_in = int(payload.get("expires_in", 3600))
-    exp_dt = datetime.now(timezone.utc)
-    from datetime import timedelta
-    exp_dt = exp_dt + timedelta(seconds=expires_in)
-    new_tok["expiry"] = exp_dt.strftime("%Y-%m-%dT%H:%M:%S.000000Z")
     return new_tok
 
 
-def get_access_token() -> str:
+def get_access_token(force_refresh: bool = False) -> str:
     """Return a valid access token, refreshing if necessary. Thread-safe."""
     global _cached_access_token
     with _token_lock:
         data = _read_token_from_disk()
+        if not data and "ANTIGRAVITY_REFRESH_TOKEN" in os.environ:
+            data = {
+                "auth_method": "oauth",
+                "token": {
+                    "refresh_token": os.environ["ANTIGRAVITY_REFRESH_TOKEN"],
+                    "token_type": "Bearer",
+                },
+            }
+
         if not data:
             raise RuntimeError(
-                f"No OAuth token found at {TOKEN_FILE}. "
-                "Run `agy` to authenticate first."
+                f"No OAuth token found at {_get_token_file_path()}. "
+                "Run `python antigravity_proxy.py --login` or `agy` to authenticate first."
             )
-        token_obj = data.get("token") or {}
+
+        # Handle both nested {"token": {...}} and flat {...} schemas
+        token_obj = data.get("token") if isinstance(data.get("token"), dict) else data
         access_token = token_obj.get("access_token")
         expiry_ts = _parse_expiry(token_obj.get("expiry"))
         now = time.time()
 
         needs_refresh = (
-            not access_token
+            force_refresh
+            or not access_token
             or expiry_ts == 0.0
             or (expiry_ts - now) < TOKEN_REFRESH_SKEW
         )
 
         if needs_refresh:
-            refresh_token = token_obj.get("refresh_token")
+            refresh_token = token_obj.get("refresh_token") or data.get("refresh_token")
             if not refresh_token:
-                raise RuntimeError("No refresh_token available; re-run `agy` to authenticate.")
-            _log("Access token expired (or missing) — refreshing...")
+                raise RuntimeError(
+                    "No refresh_token available; run `python antigravity_proxy.py --login` or `agy` to authenticate."
+                )
+            _log("Refreshing OAuth access token...")
             new_tok = _refresh_access_token(refresh_token)
-            data["token"] = new_tok
+
+            # Preserve schema structure
+            if "token" in data and isinstance(data["token"], dict):
+                data["token"].update(new_tok)
+            else:
+                data.update(new_tok)
+
             _write_token_to_disk(data)
             access_token = new_tok["access_token"]
+            _log(f"Token refreshed successfully (valid for ~{TOKEN_REFRESH_SKEW // 60}m+)")
 
         _cached_access_token = access_token
         return access_token
+
+
+def _background_token_refresher(stop_event: threading.Event, check_interval: int = 60):
+    """Periodically check token expiry and proactively refresh before it expires.
+    This ensures requests never stall or hit 401 due to expired tokens."""
+    _log("Background token refresher started (proactive auto-refresh enabled)")
+    while not stop_event.is_set():
+        try:
+            data = _read_token_from_disk()
+            if data:
+                token_obj = data.get("token") if isinstance(data.get("token"), dict) else data
+                expiry_ts = _parse_expiry(token_obj.get("expiry"))
+                remaining = expiry_ts - time.time()
+                # Proactively refresh if less than 300s (5m) remain
+                if expiry_ts > 0 and remaining < 300:
+                    _log(f"Token has {int(remaining)}s remaining (< 300s) — performing proactive background refresh...")
+                    get_access_token(force_refresh=True)
+        except Exception as e:
+            _log(f"Background token refresh check warning: {e}")
+        stop_event.wait(check_interval)
+
+
+def run_oauth_login(port: int = 51121):
+    """Interactive PKCE OAuth login flow for Google Antigravity.
+    Runs a local callback server, opens the browser, and saves credentials."""
+    code_verifier = secrets.token_urlsafe(64)
+    code_challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("utf-8")).digest())
+        .decode("utf-8")
+        .rstrip("=")
+    )
+
+    redirect_uri = f"http://localhost:{port}/oauth-callback"
+    scopes = [
+        "https://www.googleapis.com/auth/cloud-platform",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+    ]
+    query_params = {
+        "client_id": CLIENT_ID,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": " ".join(scopes),
+        "access_type": "offline",
+        "prompt": "consent",
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(query_params)}"
+
+    auth_code_holder = {"code": None, "error": None}
+
+    class OAuthCallbackHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            pass
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            if parsed.path == "/oauth-callback":
+                params = parse_qs(parsed.query)
+                if "code" in params:
+                    auth_code_holder["code"] = params["code"][0]
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    html = (
+                        "<html><body style='font-family:sans-serif;text-align:center;padding-top:50px;'>"
+                        "<h1 style='color:#10b981;'>Authentication Successful!</h1>"
+                        "<p>Google Antigravity token received. You can close this tab and return to the terminal.</p>"
+                        "</body></html>"
+                    )
+                    self.wfile.write(html.encode("utf-8"))
+                else:
+                    err = params.get("error", ["Unknown error"])[0]
+                    auth_code_holder["error"] = err
+                    self.send_response(400)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    html = (
+                        f"<html><body style='font-family:sans-serif;text-align:center;padding-top:50px;'>"
+                        f"<h1 style='color:#ef4444;'>Authentication Failed</h1>"
+                        f"<p>{err}</p>"
+                        f"</body></html>"
+                    )
+                    self.wfile.write(html.encode("utf-8"))
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+    _log("=" * 65)
+    _log("Starting Antigravity OAuth Login")
+    _log("=" * 65)
+    _log(f"Callback server listening on http://localhost:{port}/oauth-callback")
+    _log("Opening browser for Google sign-in...")
+    _log("If the browser doesn't open automatically, copy and paste this URL:")
+    print(f"\n{auth_url}\n", flush=True)
+
+    try:
+        cb_server = ThreadingHTTPServer(("127.0.0.1", port), OAuthCallbackHandler)
+    except OSError as e:
+        _log(f"ERROR: Cannot bind to port {port}: {e}")
+        _log(f"Another application might be using port {port}. Try --login-port <port>")
+        sys.exit(1)
+
+    try:
+        webbrowser.open(auth_url)
+    except Exception:
+        pass
+
+    try:
+        cb_server.serve_forever()
+    finally:
+        cb_server.server_close()
+
+    if auth_code_holder.get("error"):
+        _log(f"ERROR: Authentication failed from Google: {auth_code_holder['error']}")
+        sys.exit(1)
+
+    code = auth_code_holder.get("code")
+    if not code:
+        _log("ERROR: No authorization code received.")
+        sys.exit(1)
+
+    _log("Authorization code received! Exchanging for tokens...")
+
+    token_post_data = urlencode({
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "code": code,
+        "code_verifier": code_verifier,
+        "grant_type": "authorization_code",
+        "redirect_uri": redirect_uri,
+    }).encode("utf-8")
+
+    req = Request(OAUTH_TOKEN_URL, data=token_post_data, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with urlopen(req, timeout=30) as resp:
+            token_resp = json.loads(resp.read().decode())
+    except HTTPError as e:
+        err_body = e.read().decode()
+        _log(f"ERROR: Token exchange failed (HTTP {e.code}): {err_body}")
+        sys.exit(1)
+    except Exception as e:
+        _log(f"ERROR: Token exchange network error: {e}")
+        sys.exit(1)
+
+    access_token = token_resp.get("access_token")
+    refresh_token = token_resp.get("refresh_token")
+    expires_in = int(token_resp.get("expires_in", 3600))
+    exp_dt = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+    expiry_str = exp_dt.strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+
+    if not refresh_token:
+        _log("WARNING: Google did not return a refresh token (maybe already consented).")
+
+    token_data = {
+        "auth_method": "oauth",
+        "token": {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": token_resp.get("token_type", "Bearer"),
+            "expiry": expiry_str,
+        },
+    }
+
+    _write_token_to_disk(token_data)
+    _log(f"Successfully saved tokens to: {_get_token_file_path()}")
+
+    # Test token and discover project ID
+    try:
+        _log("Verifying token with Google Cloud Code Assist...")
+        pid = _load_code_assist(access_token)
+        _log(f"SUCCESS! Connected to Antigravity project: {pid}")
+    except Exception as e:
+        _log(f"Notice: Token saved, but project discovery test returned: {e}")
+
+    _log("\nYou're all set! You can now start the proxy with:")
+    _log("  python antigravity_proxy.py")
+    _log("  or double click: start_proxy.bat\n")
+
+
+def check_token():
+    """Inspect and display token validity and exit."""
+    path = _get_token_file_path()
+    print(f"Token file path: {path}")
+    if not os.path.isfile(path):
+        print("Status: Token file NOT found.")
+        print("Run `python antigravity_proxy.py --login` to sign in.")
+        return False
+    data = _read_token_from_disk()
+    if not data:
+        print("Status: Token file cannot be read or parsed.")
+        return False
+    token_obj = data.get("token") if isinstance(data.get("token"), dict) else data
+    expiry_ts = _parse_expiry(token_obj.get("expiry"))
+    remaining = int(expiry_ts - time.time())
+    has_refresh = bool(token_obj.get("refresh_token") or data.get("refresh_token"))
+    print(f"Auth method:       {data.get('auth_method', 'unknown')}")
+    print(f"Has access token:  {bool(token_obj.get('access_token'))}")
+    print(f"Has refresh token: {has_refresh}")
+    print(f"Expiry:            {token_obj.get('expiry')}")
+    if remaining > 0:
+        print(f"Expires in:        {remaining} seconds ({remaining // 60}m {remaining % 60}s)")
+    else:
+        print(f"Expired:           {-remaining} seconds ago (will auto-refresh on next use)")
+    return True
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -256,45 +627,45 @@ def get_access_token() -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _load_code_assist(access_token: str) -> str:
-    """Discover the cloudaicompanion project ID. Returns project id string.
+    """Discover the cloudaicompanion project ID. Returns project id string."""
+    endpoints = [PRIMARY_ENDPOINT]
+    if FALLBACK_ENDPOINT and FALLBACK_ENDPOINT not in endpoints:
+        endpoints.append(FALLBACK_ENDPOINT)
 
-    NOTE: The metadata field (ideType/platform/pluginType) is rejected by the
-    API with INVALID_ARGUMENT for all known enum string values. Sending an
-    empty body {} works and returns the cloudaicompanionProject. The Client-Metadata
-    header still carries the ide/plugin info.
-    """
-    body = json.dumps({}).encode()
-    req = Request(LOAD_CODEASSIST_URL, data=body, method="POST")
-    req.add_header("Authorization", f"Bearer {access_token}")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("User-Agent", ANTIGRAVITY_USER_AGENT)
-    req.add_header("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
-    req.add_header("Client-Metadata", CLIENT_METADATA)
-    try:
-        with urlopen(req, timeout=60) as resp:
-            payload = json.loads(resp.read().decode())
-    except HTTPError as e:
-        detail = ""
+    last_err = None
+    for ep in endpoints:
+        body = json.dumps({}).encode()
+        url = f"{ep}/v1internal:loadCodeAssist"
+        req = Request(url, data=body, method="POST")
+        req.add_header("Authorization", f"Bearer {access_token}")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("User-Agent", ANTIGRAVITY_USER_AGENT)
+        req.add_header("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
+        req.add_header("Client-Metadata", CLIENT_METADATA)
         try:
-            detail = e.read().decode()
-        except Exception:
-            pass
-        raise RuntimeError(f"loadCodeAssist failed (HTTP {e.code}): {detail}")
-    except URLError as e:
-        raise RuntimeError(f"loadCodeAssist network error: {e}")
+            with urlopen(req, timeout=60) as resp:
+                payload = json.loads(resp.read().decode())
+            project_id = (
+                payload.get("cloudaicompanionProject")
+                or payload.get("cloudaicompanion_project")
+            )
+            if not project_id:
+                project_id = _deep_find(payload, "cloudaicompanionProject")
+            if project_id:
+                return project_id
+        except HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode()
+            except Exception:
+                pass
+            last_err = RuntimeError(f"loadCodeAssist failed (HTTP {e.code}) on {ep}: {detail}")
+        except URLError as e:
+            last_err = RuntimeError(f"loadCodeAssist network error on {ep}: {e}")
 
-    project_id = (
-        payload.get("cloudaicompanionProject")
-        or payload.get("cloudaicompanion_project")
-    )
-    if not project_id:
-        # Some responses nest it differently; do a recursive search.
-        project_id = _deep_find(payload, "cloudaicompanionProject")
-    if not project_id:
-        raise RuntimeError(
-            f"loadCodeAssist did not return a project ID. Response: {payload}"
-        )
-    return project_id
+    if last_err:
+        raise last_err
+    raise RuntimeError("loadCodeAssist did not return a project ID from any endpoint.")
 
 
 def _deep_find(obj, key):
@@ -314,13 +685,13 @@ def _deep_find(obj, key):
     return None
 
 
-def get_project_id() -> str:
+def get_project_id(force_refresh: bool = False) -> str:
     """Return cached project id, discovering it if needed. Thread-safe."""
     global _cached_project_id
     with _project_lock:
-        if _cached_project_id:
+        if _cached_project_id and not force_refresh:
             return _cached_project_id
-        token = get_access_token()
+        token = get_access_token(force_refresh=force_refresh)
         pid = _load_code_assist(token)
         _cached_project_id = pid
         _log(f"Discovered project ID: {pid}")
@@ -332,12 +703,7 @@ def get_project_id() -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _content_to_text(content) -> str:
-    """Normalize an OpenAI message 'content' field to plain text.
-
-    Handles str, list of content blocks [{type: text, text: ...}, ...], and None.
-    Non-text blocks (images, etc.) are represented as a placeholder marker so
-    the model knows something was there even if we can't inline binary data.
-    """
+    """Normalize an OpenAI message 'content' field to plain text."""
     if content is None:
         return ""
     if isinstance(content, str):
@@ -349,30 +715,83 @@ def _content_to_text(content) -> str:
                 chunks.append(str(block))
                 continue
             btype = block.get("type", "text")
-            if btype == "text":
+            if btype in ("text", "input_text"):
                 chunks.append(block.get("text", ""))
             elif btype == "image_url":
-                url = ""
                 iu = block.get("image_url")
-                if isinstance(iu, dict):
-                    url = iu.get("url", "")
-                elif isinstance(iu, str):
-                    url = iu
-                # We pass the data URL through; Gemini's inlineData supports it.
-                if url.startswith("data:"):
-                    # Best-effort: note its presence; full image passthrough
-                    # would require parts[].inlineData. Keep as text marker.
-                    chunks.append(f"[image: {url[:60]}...]")
-                else:
-                    chunks.append(f"[image: {url}]")
-            elif btype == "input_text":
-                chunks.append(block.get("text", ""))
-            elif btype == "input_image":
-                chunks.append("[image provided]")
+                url = iu.get("url", "") if isinstance(iu, dict) else str(iu)
+                chunks.append(f"[image: {url[:60]}...]" if url.startswith("data:") else f"[image: {url}]")
             else:
-                chunks.append(f"[{btype}: {json.dumps(block.get('text', ''))[:100]}]")
+                chunks.append(f"[{btype}]")
         return "\n".join(c for c in chunks if c)
     return str(content)
+
+
+def _content_to_parts(content) -> list:
+    """Convert an OpenAI message 'content' into native Gemini parts.
+
+    Supports:
+      - Plain text string -> [{'text': ...}]
+      - Multimodal content blocks:
+        - Text: {'type': 'text', 'text': ...}
+        - Images / PDFs / Media via data URI:
+          {'type': 'image_url', 'image_url': {'url': 'data:<mime>;base64,<data>'}}
+        - Audio: {'type': 'input_audio', 'input_audio': {'data': ..., 'format': ...}}
+        - File/Document: {'type': 'file'|'document', 'file': {'data': ..., 'mime_type': ...}}
+        - Direct Gemini parts: {'inlineData': ...} or {'inline_data': ...}
+    """
+    if not content:
+        return []
+    if isinstance(content, str):
+        return [{"text": content}] if content else []
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                s = str(block)
+                if s:
+                    parts.append({"text": s})
+                continue
+            btype = block.get("type", "text")
+            if btype in ("text", "input_text") or "text" in block:
+                t = block.get("text", "")
+                if t:
+                    parts.append({"text": t})
+            elif btype == "image_url" or "image_url" in block:
+                iu = block.get("image_url")
+                url = iu.get("url", "") if isinstance(iu, dict) else str(iu)
+                if url.startswith("data:"):
+                    try:
+                        header, b64_data = url.split(",", 1)
+                        mime = header[5:].split(";")[0] or "image/png"
+                        parts.append({"inlineData": {"mimeType": mime, "data": b64_data}})
+                    except Exception:
+                        parts.append({"text": f"[image: {url[:60]}...]"})
+                else:
+                    parts.append({"text": f"[Image: {url}]"})
+            elif btype == "input_audio" or "input_audio" in block:
+                ia = block.get("input_audio", {})
+                data = ia.get("data", "")
+                fmt = ia.get("format", "wav")
+                mime = f"audio/{fmt}" if not str(fmt).startswith("audio/") else fmt
+                if data:
+                    parts.append({"inlineData": {"mimeType": mime, "data": data}})
+            elif btype in ("file", "document") or "file" in block or "document" in block:
+                fobj = block.get("file") or block.get("document") or {}
+                data = fobj.get("data") or fobj.get("base64", "")
+                mime = fobj.get("mime_type") or fobj.get("mimeType", "application/pdf")
+                if data:
+                    parts.append({"inlineData": {"mimeType": mime, "data": data}})
+            elif "inlineData" in block:
+                parts.append({"inlineData": block["inlineData"]})
+            elif "inline_data" in block:
+                parts.append({"inlineData": block["inline_data"]})
+            else:
+                s = _content_to_text(block)
+                if s:
+                    parts.append({"text": s})
+        return parts
+    return [{"text": str(content)}]
 
 
 def _openai_tools_to_gemini(tools: list) -> list:
@@ -540,10 +959,7 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
             continue
 
         if role == "assistant":
-            parts = []
-            text = _content_to_text(msg.get("content"))
-            if text:
-                parts.append({"text": text})
+            parts = _content_to_parts(msg.get("content"))
             # Prior tool calls from the assistant -> functionCall parts.
             # Decode the encoded tool_call.id to recover the Gemini fc_id and thoughtSignature.
             tool_calls = msg.get("tool_calls") or []
@@ -591,10 +1007,7 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
             continue
 
         # Default: user role.
-        text = _content_to_text(msg.get("content"))
-        parts = []
-        if text:
-            parts.append({"text": text})
+        parts = _content_to_parts(msg.get("content"))
         # Some clients send tool_calls on user messages; handle gracefully.
         for tc in (msg.get("tool_calls") or []):
             if not isinstance(tc, dict):
@@ -903,9 +1316,11 @@ def _make_upstream_request(url: str, envelope: dict, streaming: bool = False):
     return req
 
 
-def call_generate_content(envelope: dict) -> dict:
+def call_generate_content(envelope: dict, retry_on_401: bool = True, endpoint: str = None) -> dict:
     """Non-streaming call. Returns the unwrapped inner Gemini response dict."""
-    req = _make_upstream_request(GENERATE_CONTENT_URL, envelope, streaming=False)
+    ep = endpoint or PRIMARY_ENDPOINT
+    url = f"{ep}/v1internal:generateContent"
+    req = _make_upstream_request(url, envelope, streaming=False)
     try:
         with urlopen(req, timeout=UPSTREAM_TIMEOUT) as resp:
             raw = resp.read().decode()
@@ -915,8 +1330,30 @@ def call_generate_content(envelope: dict) -> dict:
             detail = e.read().decode()
         except Exception:
             pass
+        if e.code == 401 and retry_on_401:
+            _log("HTTP 401 received from upstream — force-refreshing access token and retrying...")
+            try:
+                get_access_token(force_refresh=True)
+                get_project_id(force_refresh=True)
+                envelope["project"] = get_project_id()
+                return call_generate_content(envelope, retry_on_401=False, endpoint=ep)
+            except Exception as refresh_err:
+                _log(f"Force token refresh on 401 failed: {refresh_err}")
+        # Retry on fallback endpoint if 429, 404, or 5xx on primary
+        if ep == PRIMARY_ENDPOINT and FALLBACK_ENDPOINT and e.code in (404, 429, 500, 502, 503):
+            _log(f"Upstream returned HTTP {e.code} on primary endpoint ({PRIMARY_ENDPOINT}). Retrying with fallback ({FALLBACK_ENDPOINT})...")
+            try:
+                return call_generate_content(envelope, retry_on_401=retry_on_401, endpoint=FALLBACK_ENDPOINT)
+            except Exception as fb_err:
+                _log(f"Fallback endpoint attempt failed: {fb_err}")
         raise UpstreamError(f"Upstream HTTP {e.code}: {detail}", status=e.code, body=detail)
     except URLError as e:
+        if ep == PRIMARY_ENDPOINT and FALLBACK_ENDPOINT:
+            _log(f"Primary endpoint network error ({PRIMARY_ENDPOINT}): {e}. Retrying with fallback ({FALLBACK_ENDPOINT})...")
+            try:
+                return call_generate_content(envelope, retry_on_401=retry_on_401, endpoint=FALLBACK_ENDPOINT)
+            except Exception as fb_err:
+                _log(f"Fallback endpoint attempt failed: {fb_err}")
         raise UpstreamError(f"Upstream network error: {e}", status=502)
 
     try:
@@ -930,7 +1367,7 @@ def call_generate_content(envelope: dict) -> dict:
     return payload
 
 
-def stream_generate_content(envelope: dict):
+def stream_generate_content(envelope: dict, retry_on_401: bool = True, endpoint: str = None):
     """Streaming call. Yields parsed JSON event objects from the SSE stream.
 
     The Antigravity stream endpoint returns either:
@@ -938,7 +1375,9 @@ def stream_generate_content(envelope: dict):
       - Or a bare JSON array of incremental response objects (some endpoints).
     We handle both.
     """
-    req = _make_upstream_request(STREAM_GENERATE_CONTENT_URL, envelope, streaming=True)
+    ep = endpoint or PRIMARY_ENDPOINT
+    url = f"{ep}/v1internal:streamGenerateContent?alt=sse"
+    req = _make_upstream_request(url, envelope, streaming=True)
     try:
         resp = urlopen(req, timeout=UPSTREAM_TIMEOUT)
     except HTTPError as e:
@@ -947,8 +1386,32 @@ def stream_generate_content(envelope: dict):
             detail = e.read().decode()
         except Exception:
             pass
+        if e.code == 401 and retry_on_401:
+            _log("HTTP 401 received during stream setup — force-refreshing token and retrying...")
+            try:
+                get_access_token(force_refresh=True)
+                get_project_id(force_refresh=True)
+                envelope["project"] = get_project_id()
+                yield from stream_generate_content(envelope, retry_on_401=False, endpoint=ep)
+                return
+            except Exception as refresh_err:
+                _log(f"Force token refresh on stream 401 failed: {refresh_err}")
+        if ep == PRIMARY_ENDPOINT and FALLBACK_ENDPOINT and e.code in (404, 429, 500, 502, 503):
+            _log(f"Upstream stream returned HTTP {e.code} on primary endpoint ({PRIMARY_ENDPOINT}). Retrying with fallback ({FALLBACK_ENDPOINT})...")
+            try:
+                yield from stream_generate_content(envelope, retry_on_401=retry_on_401, endpoint=FALLBACK_ENDPOINT)
+                return
+            except Exception as fb_err:
+                _log(f"Fallback stream attempt failed: {fb_err}")
         raise UpstreamError(f"Upstream stream HTTP {e.code}: {detail}", status=e.code, body=detail)
     except URLError as e:
+        if ep == PRIMARY_ENDPOINT and FALLBACK_ENDPOINT:
+            _log(f"Primary stream network error ({PRIMARY_ENDPOINT}): {e}. Retrying with fallback ({FALLBACK_ENDPOINT})...")
+            try:
+                yield from stream_generate_content(envelope, retry_on_401=retry_on_401, endpoint=FALLBACK_ENDPOINT)
+                return
+            except Exception as fb_err:
+                _log(f"Fallback stream attempt failed: {fb_err}")
         raise UpstreamError(f"Upstream stream network error: {e}", status=502)
 
     try:
@@ -1171,11 +1634,29 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # We do our own logging.
         pass
 
+    def do_OPTIONS(self):
+        """Handle CORS pre-flight requests."""
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization, X-Requested-With, X-Goog-Api-Client, Client-Metadata",
+        )
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.end_headers()
+
     def _send_json(self, code, data):
         body = json.dumps(data).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization, X-Requested-With, X-Goog-Api-Client, Client-Metadata",
+        )
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -1207,7 +1688,28 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._handle_models()
                 self._log_req("GET", path, 200, time.time() - t0)
             elif path in ("/health", "/"):
-                self._send_json(200, {"status": "ok", "service": "antigravity-proxy"})
+                health_data = {
+                    "status": "ok",
+                    "service": "antigravity-proxy",
+                    "token_file": _get_token_file_path(),
+                    "auth": {"authenticated": False},
+                }
+                try:
+                    data = _read_token_from_disk()
+                    if data:
+                        token_obj = data.get("token") if isinstance(data.get("token"), dict) else data
+                        expiry_ts = _parse_expiry(token_obj.get("expiry"))
+                        has_refresh = bool(token_obj.get("refresh_token") or data.get("refresh_token"))
+                        rem = max(0, int(expiry_ts - time.time())) if expiry_ts > 0 else 0
+                        health_data["auth"] = {
+                            "authenticated": True,
+                            "has_refresh_token": has_refresh,
+                            "expires_in_seconds": rem,
+                            "project_id": _cached_project_id or "pending_discovery",
+                        }
+                except Exception as ex:
+                    health_data["auth"]["error"] = str(ex)
+                self._send_json(200, health_data)
                 self._log_req("GET", path, 200, time.time() - t0)
             else:
                 self._send_error_json("not_found", "Not found", err_type="invalid_request_error", http_code=404)
@@ -1384,6 +1886,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
             self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
         except Exception:
             return
@@ -1662,33 +2165,87 @@ class ProxyHandler(BaseHTTPRequestHandler):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _preflight_check():
-    """Validate the token file exists and is readable before starting."""
-    if not os.path.isfile(TOKEN_FILE):
-        _log(f"ERROR: Token file not found at {TOKEN_FILE}")
-        _log("Run the Antigravity CLI (`agy`) to authenticate first.")
+    """Validate token availability before starting the server."""
+    token_path = _get_token_file_path()
+    if not os.path.isfile(token_path) and "ANTIGRAVITY_REFRESH_TOKEN" not in os.environ:
+        _log(f"ERROR: Token file not found at {token_path}")
+        _log("Please authenticate first using ONE of these methods:")
+        _log("  1. Run: python antigravity_proxy.py --login  (recommended on Windows)")
+        _log("  2. Double-click: login.bat")
+        _log("  3. Run: agy (if you installed the Antigravity CLI)")
+        _log("  4. Set the ANTIGRAVITY_REFRESH_TOKEN environment variable")
         return False
-    data = _read_token_from_disk()
-    if not data:
-        _log("ERROR: Token file exists but could not be parsed.")
+
+    try:
+        tok = get_access_token()
+        _log("OAuth authentication check PASSED.")
+        return True
+    except Exception as e:
+        _log(f"ERROR: Authentication check failed: {e}")
+        _log("Try re-authenticating with: python antigravity_proxy.py --login")
         return False
-    token_obj = data.get("token") or {}
-    if not token_obj.get("refresh_token"):
-        _log("ERROR: No refresh_token in token file. Re-run `agy` to authenticate.")
-        return False
-    _log(f"Token file OK (auth_method={data.get('auth_method', 'unknown')})")
-    return True
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Antigravity OpenAI-compatible proxy (Cloud Code Assist API)"
     )
-    parser.add_argument("--port", type=int, default=8877, help="Port to listen on (default 8877)")
-    parser.add_argument("--host", default="127.0.0.1", help="Host to bind to (default 127.0.0.1)")
+    default_port = int(os.environ.get("ANTIGRAVITY_PORT") or os.environ.get("PORT") or 8877)
+    default_host = os.environ.get("ANTIGRAVITY_HOST") or os.environ.get("HOST") or "127.0.0.1"
+    parser.add_argument("--port", type=int, default=default_port, help=f"Port to listen on (default: {default_port})")
+    parser.add_argument("--host", default=default_host, help=f"Host to bind to (default: {default_host})")
+    parser.add_argument(
+        "--login",
+        action="store_true",
+        help="Launch interactive browser login to obtain OAuth tokens",
+    )
+    parser.add_argument(
+        "--login-port",
+        type=int,
+        default=51121,
+        help="Local callback port for OAuth login (default: 51121)",
+    )
+    parser.add_argument(
+        "--check-token",
+        action="store_true",
+        help="Inspect and display token validity and exit",
+    )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Force refresh access token and exit",
+    )
     args = parser.parse_args()
+
+    if args.login:
+        run_oauth_login(port=args.login_port)
+        sys.exit(0)
+
+    if args.check_token:
+        success = check_token()
+        sys.exit(0 if success else 1)
+
+    if args.refresh:
+        try:
+            get_access_token(force_refresh=True)
+            _log("Token refresh complete and verified.")
+            sys.exit(0)
+        except Exception as e:
+            _log(f"Token refresh failed: {e}")
+            sys.exit(1)
 
     if not _preflight_check():
         sys.exit(1)
+
+    # Start proactive background token refresher daemon thread
+    stop_refresher = threading.Event()
+    refresher_thread = threading.Thread(
+        target=_background_token_refresher,
+        args=(stop_refresher, 60),
+        name="TokenRefresher",
+        daemon=True,
+    )
+    refresher_thread.start()
 
     # Pre-discover the project ID so the first request is fast.
     try:
@@ -1698,16 +2255,19 @@ def main():
         _log("It will be discovered on the first request.")
 
     server = ThreadingHTTPServer((args.host, args.port), ProxyHandler)
+    server.allow_reuse_address = True
     server.daemon_threads = True
     _log(f"Antigravity proxy listening on http://{args.host}:{args.port}/v1")
+    _log(f"  Default model: {DEFAULT_MODEL}")
     _log(f"  Models: {', '.join(MODEL_MAP.keys())}")
-    _log(f"  Token:  {TOKEN_FILE}")
-    _log(f"  Press Ctrl+C to stop")
+    _log(f"  Token:  {_get_token_file_path()}")
+    _log("  Press Ctrl+C to stop")
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         _log("\nShutting down...")
+        stop_refresher.set()
         server.shutdown()
 
 

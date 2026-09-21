@@ -43,21 +43,36 @@ Your Tool (OpenAI format)  →  Antigravity Proxy (localhost:8877)  →  Gemini 
 - **OAuth token auto-refresh** — token refreshed automatically when expired, no manual intervention
 - **Zero pip dependencies** — Python 3.10+ standard library only
 - **systemd service** included — run as a background service on Linux
+- **Windows helper scripts** included — one-click sign-in (`login.bat`), console/background launchers (`start_proxy.bat`, `start_proxy_background.vbs`), and status checker (`status.bat`)
 
 ---
 
 ## Available Models
 
-| Friendly Name         | Backend Model              | Thinking       | Type    |
-|-----------------------|----------------------------|----------------|---------|
-| `gemini-3.1-pro`      | `gemini-3.1-pro-low`       | Low            | Gemini  |
-| `gemini-3.1-pro-high` | `gemini-3.1-pro-low`       | High           | Gemini  |
-| `gemini-3-flash`      | `gemini-3-flash`           | —              | Gemini  |
-| `gemini-3.5-flash`    | `gemini-3.5-flash-low`     | —              | Gemini  |
-| `gemini-2.5-pro`      | `gemini-2.5-pro`           | —              | Gemini  |
-| `gemini-2.5-flash`    | `gemini-2.5-flash`         | —              | Gemini  |
-| `claude-sonnet-4.6`   | `claude-sonnet-4-6`        | —              | Claude  |
-| `claude-opus-4.6`     | `claude-opus-4-6-thinking` | Enabled        | Claude  |
+| Friendly Name           | Backend Model              | Thinking       | Type    |
+|-------------------------|----------------------------|----------------|---------|
+| `gemini-3.8-flash`        | `gemini-3.8-flash-tiered`  | Medium (Default)| Gemini  |
+| `gemini-3.8-flash-high`   | `gemini-3.8-flash-tiered`  | High           | Gemini  |
+| `gemini-3.8-flash-medium` | `gemini-3.8-flash-tiered`  | Medium         | Gemini  |
+| `gemini-3.8-flash-low`    | `gemini-3.8-flash-tiered`  | Low            | Gemini  |
+| `gemini-3.7-flash`        | `gemini-3.7-flash-tiered`  | Medium (Default)| Gemini  |
+| `gemini-3.7-flash-high`   | `gemini-3.7-flash-tiered`  | High           | Gemini  |
+| `gemini-3.7-flash-medium` | `gemini-3.7-flash-tiered`  | Medium         | Gemini  |
+| `gemini-3.7-flash-low`    | `gemini-3.7-flash-tiered`  | Low            | Gemini  |
+| `gemini-3.6-flash`        | `gemini-3.6-flash-tiered`  | Medium (Default)| Gemini  |
+| `gemini-3.6-flash-high`   | `gemini-3.6-flash-tiered`  | High           | Gemini  |
+| `gemini-3.6-flash-medium` | `gemini-3.6-flash-tiered`  | Medium         | Gemini  |
+| `gemini-3.6-flash-low`    | `gemini-3.6-flash-tiered`  | Low            | Gemini  |
+| `gemini-3.5-flash`        | `gemini-3.5-flash-low`     | —              | Gemini  |
+| `gemini-3.1-pro`          | `gemini-3.1-pro-low`       | Low (Default)  | Gemini  |
+| `gemini-3.1-pro-high`     | `gemini-3.1-pro-low`       | High           | Gemini  |
+| `gemini-3.1-pro-low`      | `gemini-3.1-pro-low`       | Low            | Gemini  |
+| `gemini-3-flash`          | `gemini-3-flash`           | —              | Gemini  |
+| `gemini-2.5-pro`          | `gemini-2.5-pro`           | —              | Gemini  |
+| `gemini-2.5-flash`        | `gemini-2.5-flash`         | —              | Gemini  |
+| `claude-sonnet-4.6`       | `claude-sonnet-4-6`        | Thinking       | Claude  |
+| `claude-opus-4.6`         | `claude-opus-4-6-thinking` | Thinking       | Claude  |
+| `gpt-oss-120b`            | `gpt-oss-120b-medium`      | Medium         | OSS     |
 
 You always use the **friendly name** in your client. The proxy handles translation.
 
@@ -67,31 +82,42 @@ You always use the **friendly name** in your client. The proxy handles translati
 
 ### Prerequisites
 
-1. **Python 3.10+** — check with `python3 --version`
-2. **Antigravity CLI** — install and authenticate (one-time):
+1. **Python 3.10+** — check with `python --version` or `python3 --version`
+2. **Authenticate with Google** (one-time):
 
+#### Windows (Easiest — Built-in Login)
+Run the included login script or CLI command:
+```cmd
+login.bat
+# or
+python antigravity_proxy.py --login
+```
+This opens your browser to sign in with your Google account. The OAuth tokens are saved automatically!
+
+#### macOS / Linux
+Either use the built-in login:
 ```bash
-# Install agy (macOS/Linux)
+python3 antigravity_proxy.py --login
+```
+Or use the Antigravity CLI (`agy`):
+```bash
 curl -fsSL https://storage.googleapis.com/antigravity-releases/install.sh | bash
-
-# Authenticate (opens browser, sign in with Google)
 agy
 ```
-
-> Windows: download from [antigravity.google](https://antigravity.google/)
 
 ### Install & Run
 
 ```bash
-git clone https://github.com/usamashehab/antigravity-proxy.git
-cd antigravity-proxy
+# Windows
+start_proxy.bat
+# or in background:
+wscript start_proxy_background.vbs
 
-# Start the proxy
+# macOS / Linux
 python3 antigravity_proxy.py
 
 # Verify it's running
 curl http://127.0.0.1:8877/health
-# → {"status": "ok", "service": "antigravity-proxy"}
 ```
 
 That's it. The proxy is now listening on `http://127.0.0.1:8877`.
@@ -212,11 +238,23 @@ The AI will read `AGENTS.md` and guide you through every step: prerequisites che
 ### CLI Arguments
 
 ```
-python3 antigravity_proxy.py [--port PORT] [--host HOST]
+python3 antigravity_proxy.py [OPTIONS]
 
-  --port PORT    Port to listen on (default: 8877)
-  --host HOST    Host to bind to (default: 127.0.0.1)
+  --port PORT           Port to listen on (default: 8877)
+  --host HOST           Host to bind to (default: 127.0.0.1)
+  --login               Launch interactive browser login to obtain OAuth tokens
+  --login-port PORT     Local callback port for OAuth login (default: 51121)
+  --check-token         Inspect and display token validity and exit
+  --refresh             Force refresh access token and exit
 ```
+
+### Windows Helper Scripts
+
+- `login.bat` — Launches interactive browser sign-in.
+- `start_proxy.bat` — Launches the proxy in foreground with UTF-8 support.
+- `start_proxy_background.vbs` — Runs the proxy silently in the background (no console window).
+- `stop_proxy.bat` — Stops the proxy running on port 8877.
+- `status.bat` — Queries proxy status and token validity.
 
 ### Run as a systemd Service (Linux)
 
@@ -239,6 +277,8 @@ systemctl --user status antigravity-proxy
 
 | Variable                     | Default | Description                        |
 |------------------------------|---------|------------------------------------|
+| `ANTIGRAVITY_TOKEN_PATH`     | `~/.gemini/antigravity-cli/antigravity-oauth-token` | Custom path to token file |
+| `ANTIGRAVITY_REFRESH_TOKEN`  | None    | Pass refresh token directly via env var |
 | `ANTIGRAVITY_CLIENT_ID`      | built-in| Override OAuth client ID           |
 | `ANTIGRAVITY_CLIENT_SECRET`  | built-in| Override OAuth client secret       |
 
