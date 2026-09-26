@@ -1630,6 +1630,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "AntigravityProxy/2.0"
 
+    def handle(self):
+        """Handle incoming requests, silently ignoring client disconnects on idle keep-alive sockets."""
+        try:
+            super().handle()
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            pass
+
     def log_message(self, fmt, *args):
         # We do our own logging.
         pass
@@ -2186,6 +2193,22 @@ def _preflight_check():
         return False
 
 
+class AntigravityHTTPServer(ThreadingHTTPServer):
+    """Threading HTTP server that suppresses harmless client-disconnect tracebacks on Windows."""
+
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        """Suppress noisy tracebacks when clients close idle keep-alive connections abruptly."""
+        exctype, value, tb = sys.exc_info()
+        if exctype in (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            return
+        if isinstance(value, OSError) and getattr(value, "winerror", None) in (10053, 10054):
+            return
+        super().handle_error(request, client_address)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Antigravity OpenAI-compatible proxy (Cloud Code Assist API)"
@@ -2254,7 +2277,7 @@ def main():
         _log(f"WARNING: Could not pre-discover project ID: {e}")
         _log("It will be discovered on the first request.")
 
-    server = ThreadingHTTPServer((args.host, args.port), ProxyHandler)
+    server = AntigravityHTTPServer((args.host, args.port), ProxyHandler)
     server.allow_reuse_address = True
     server.daemon_threads = True
     _log(f"Antigravity proxy listening on http://{args.host}:{args.port}/v1")
